@@ -1,1 +1,25 @@
-lowvram
+# Build output
+/lowvram
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Benchmarks: model weights are downloaded (see docs/bench/README.md); logs are
+# console output, the results/*.jsonl files are the record.
+/docs/bench/models/
+/docs/bench/results/*.log
+
+# Paper: LaTeX build files and the built PDF (rebuild with `make -C docs/paper`).
+# Figures and generated/*.tex are committed so the paper builds without rerunning benchmarks.
+/docs/paper/*.aux
+/docs/paper/*.bbl
+/docs/paper/*.blg
+/docs/paper/*.fdb_latexmk
+/docs/paper/*.fls
+/docs/paper/*.log
+/docs/paper/*.out
+/docs/paper/*.synctex.gz
+/docs/paper/*.toc
+/docs/paper/paper.pdf

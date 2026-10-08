@@ -1,0 +1,25 @@
+[project]
+name = "lowvram-bench"
+version = "0.1.0"
+description = "Benchmarks for the lowvram paper"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "transformers>=4.57,<5",
+    "accelerate",
+    "safetensors",
+    "tiktoken",
+    "numpy",
+    "matplotlib",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

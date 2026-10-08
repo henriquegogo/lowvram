@@ -75,6 +75,12 @@ LD_PRELOAD=/path/to/lowvram uv run script.py
   reaches zero can exhaust system RAM.
 - Linux only.
 
+## Benchmarks and paper
+
+[`docs/`](docs/README.md) holds a benchmark suite comparing lowvram with offloading,
+CPU execution and driver hints on synthetic workloads and real models, and the paper
+written from those results.
+
 ## License
 
 [MIT](LICENSE)

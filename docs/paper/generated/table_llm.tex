@@ -1,0 +1,10 @@
+\begin{tabular}{lrr}
+\toprule
+Mode & prompt tok/s & decode tok/s \\
+\midrule
+Unmodified & OOM & OOM \\
+Accelerate offload & 837 & 1.17 \\
+CPU (BF16) & 25 & 3.63 \\
+lowvram & 499 & 0.58 \\
+\bottomrule
+\end{tabular}

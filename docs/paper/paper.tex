@@ -1,0 +1,525 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{graphicx}
+\usepackage{url}
+% Optional packages (texlive-latex-extra); minimal fallbacks keep the draft building without them.
+\IfFileExists{microtype.sty}{\usepackage{microtype}}{}
+\IfFileExists{booktabs.sty}{\usepackage{booktabs}}{%
+  \newcommand{\toprule}{\hline}\newcommand{\midrule}{\hline}\newcommand{\bottomrule}{\hline}%
+  \def\cmidrule(##1)##2{\cline{##2}}}
+\IfFileExists{xcolor.sty}{\usepackage{xcolor}}{\usepackage{color}}
+\usepackage[hidelinks]{hyperref}
+
+\input{generated/numbers.tex}
+% Fallbacks so the draft builds before every benchmark has run.
+\providecommand{\na}{\textbf{??}}
+\newcommand{\num}[1]{\ifcsname #1\endcsname\csname #1\endcsname\else\na\fi}
+\newcommand{\fig}[2]{\IfFileExists{figures/#2.pdf}{\includegraphics[width=#1]{figures/#2.pdf}}{\fbox{\na\ figure #2 pending}}}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+
+
+\title{lowvram: Transparent GPU Memory Oversubscription\\for Unmodified CUDA Programs}
+\author{Henrique Soares\\\small\texttt{henriquegogo@gmail.com}}
+\date{October 2026 --- draft}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Programs written for a GPU fail with an out-of-memory error as soon as their allocations exceed
+device memory, even when the host has plenty of free RAM. The established remedies---offloading
+engines, automatic device placement, custom allocators---all require changes to the program or
+support in its framework. We present \emph{lowvram}, a 140-line C library that runs unmodified
+CUDA programs beyond device memory. It serves every \texttt{cuMemAlloc} with
+\texttt{cuMemAllocManaged}, so the NVIDIA driver's Unified Memory pages data between GPU and host on
+demand, and it enlarges the reported device memory so that self-sizing programs use the extra
+capacity. One ELF file is both the preload library and its launcher (\texttt{lowvram python
+script.py}). On a 6\,GiB laptop GPU, lowvram costs nothing measurable when a program fits. On a real
+workload---the 7.3\,GB YuE2-3B music model, which does not load on this GPU---it generates
+tokens at \num{yueLvDecode} tokens/s, \num{yueLvOfOracle}\% of the speed of a hand-pruned copy of
+the model that fits in VRAM and \num{yueLvOverAcc}$\times$ faster than Hugging Face Accelerate's
+offloading, because demand paging keeps resident exactly the half of the weights that token
+generation uses. When every step touches more data than fits, paging loses: it is
+\num{yueNarSlowdown}$\times$ slower than layer-wise offloading for YuE2's flow-matching step, and on
+a dense 4B language model it generates \num{llmLvDecode} tokens per second against
+\num{llmAccDecode} for Accelerate and \num{llmCpuDecode} on the CPU. A single driver hint that only
+the program can give recovers most of that gap. The deciding property is not the size of the
+program but whether the data a phase reuses fits in VRAM.
+\end{abstract}
+
+% ---------------------------------------------------------------------------
+\section{Introduction}
+
+Consumer and laptop GPUs commonly have 4--12\,GiB of memory, while the models people want to
+run---language models, music, image and video generators---often need more. The failure is abrupt:
+the framework's allocator asks the driver for device memory, the driver refuses, and the program
+aborts with \texttt{CUDA out of memory}, although the machine may have several times that amount
+of idle system RAM.
+
+The established remedies require intervention in the program. Frameworks offer offloading engines
+\cite{zero-offload,zero-infinity,flexgen} and automatic device placement \cite{accelerate} that
+splits a model between GPU and CPU; research systems swap tensors under the control of a planner
+\cite{vdnn,swapadvisor,capuchin}; inference engines run part of a model on the CPU
+\cite{llamacpp,powerinfer,ktransformers}. Each works for the programs written against it, but a user
+holding an arbitrary research repository cannot easily apply any of them.
+
+CUDA Unified Memory \cite{cuda-guide} offers a different mechanism. Memory allocated with
+\texttt{cudaMallocManaged} is addressable from CPU and GPU, and on Pascal and later GPUs under Linux
+it can exceed device memory: the driver migrates pages to the GPU on fault and evicts the least
+recently used ones when device memory is full \cite{zheng2016,ganguly2019}. Programs must opt in,
+however, and mainstream frameworks do not.
+
+lowvram closes that gap without touching the program. It is a shared library, loaded with
+\texttt{LD\_PRELOAD}, that turns ordinary device allocations into managed ones at the CUDA driver
+API. Our contributions are:
+\begin{itemize}
+  \item A minimal interposition design (\S\ref{sec:design}) that reaches the CUDA runtime, which
+        resolves driver functions privately through \texttt{dlsym} and \texttt{cuGetProcAddress}
+        and so escapes plain symbol interposition.
+  \item A single-file packaging technique: one ELF object that is both the preload library and
+        the launcher.
+  \item A measurement study on a 6\,GiB laptop GPU (\S\ref{sec:method}--\S\ref{sec:results}) that
+        compares transparent paging with manual streaming, framework offloading, CPU execution and
+        an oracle, on synthetic kernels and on two real models---a 7.3\,GB music model with two
+        execution paths and a dense 4B language model---and tests whether driver hints close the
+        gap to hand-written offloading.
+  \item A characterization of where transparent oversubscription is valuable and where it is
+        not (\S\ref{sec:where}).
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Background: four ways to run beyond VRAM}
+\label{sec:background}
+
+A device allocation (\texttt{cudaMalloc}) is backed by physical GPU memory for its whole
+lifetime; the driver never pages it out, so there is no fallback when memory runs out. Data that
+does not fit must live in host RAM, and there are four ways to use it (Table~\ref{tab:strategies}).
+The bandwidths that bound them on our test machine are 300\,GB/s for VRAM, roughly 6\,GB/s for
+the PCIe link (\S\ref{sec:method}) and tens of GB/s for host RAM.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{p{3.3cm}p{5.2cm}p{5.2cm}}
+\toprule
+Strategy & What happens to data that does not fit & Examples \\
+\midrule
+CPU execution & stays in RAM; the CPU computes on it & PyTorch on CPU, llama.cpp \texttt{-ngl 0} \\
+Hybrid split & stays in RAM; the CPU computes those layers or experts & llama.cpp \texttt{-ngl N}, KTransformers \\
+Explicit offload & copied to the GPU before use, by a plan & Accelerate, ZeRO-Offload, FlexGen \\
+Demand paging & migrated to the GPU on access, by the driver & Unified Memory; lowvram \\
+\bottomrule
+\end{tabular}
+\caption{Strategies for working sets larger than device memory. Only demand paging needs no
+knowledge of the program.}
+\label{tab:strategies}
+\end{table}
+
+The first three need knowledge of the computation: which tensors exist, when they are used,
+where to compute them. Demand paging needs none; its cost is that transfers start only after a
+fault, in small granules, and that eviction follows recency rather than future use.
+
+% ---------------------------------------------------------------------------
+\section{Design}
+\label{sec:design}
+
+\subsection{Allocation}
+PyTorch's caching allocator \cite{pytorch}, like most CUDA programs, obtains device memory through
+\texttt{cudaMalloc}, which calls the driver's \texttt{cuMemAlloc\_v2}. lowvram replaces that
+function:
+{\small
+\begin{verbatim}
+CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t size) {
+    init();
+    return real_alloc_managed(dptr, size, CU_MEM_ATTACH_GLOBAL);
+}
+\end{verbatim}
+}
+The returned pointer is a valid device pointer, so kernels and libraries such as cuBLAS and cuDNN
+use it unchanged, and \texttt{cuMemFree} releases it without a hook. While the working set fits,
+pages stay resident after their first touch and cost the same as device memory. Beyond that, the
+driver evicts pages to host memory and faults them back in on access: an out-of-memory failure
+becomes a slowdown.
+
+\subsection{Reported capacity}
+Some programs size themselves from \texttt{cudaMemGetInfo}: automatic device placement, for
+instance, puts on the CPU whatever does not fit in the reported free memory. lowvram therefore adds
+half of physical RAM to the free and total values returned by \texttt{cuMemGetInfo\_v2} and
+\texttt{cuDeviceTotalMem\_v2}. The addition is constant: programs that read free memory once
+behave correctly, but one that allocates until reported free memory is exhausted can exceed
+physical RAM.
+
+\subsection{Reaching the CUDA runtime}
+Symbol interposition alone does not reach most CUDA programs. The CUDA runtime does not link
+against \texttt{libcuda}: it opens the driver with \texttt{dlopen}, obtains
+\texttt{cuGetProcAddress} through \texttt{dlsym}, and resolves every other driver function through
+it. lowvram therefore also defines \texttt{dlsym}, \texttt{cuGetProcAddress} and
+\texttt{cuGetProcAddress\_v2}. Each calls the real implementation and substitutes a hook when the
+requested name is one lowvram replaces. The two lookup paths use different names---the exported
+symbol (\texttt{cuMemAlloc\_v2}) for \texttt{dlsym}, the base name (\texttt{cuMemAlloc}) for
+\texttt{cuGetProcAddress}---so the substitution table accepts both. The real \texttt{dlsym} is
+obtained with \texttt{dlvsym(RTLD\_NEXT, "dlsym", ...)} to avoid recursion. Initialization is lazy
+and happens once, on the first hooked call, because other libraries may call \texttt{dlsym} before
+lowvram's constructors run; without an NVIDIA driver the library is inert, which matters because
+the preload also reaches launchers and shells.
+
+\subsection{Single-file launcher}
+lowvram is a shared object that is also executable, as glibc's own \texttt{libc.so.6} is: a
+\texttt{.interp} section names the dynamic loader, and a linker-specified entry point
+(\texttt{-Wl,-e,lowvram\_main}) runs when the file is executed. The entry point reads its arguments
+from \texttt{/proc/self/cmdline} and its own path from \texttt{/proc/self/exe}, prepends that path
+to \texttt{LD\_PRELOAD} and \texttt{exec}s the command. Two pitfalls: without C start-up code the
+entry point receives no \texttt{argc}/\texttt{argv} and the object's constructors do not run, so
+the arguments must come from \texttt{/proc}; and the entry point is reached without a return
+address, so it must realign the stack (\texttt{force\_align\_arg\_pointer}) and never return.
+Building a position-independent executable and preloading it instead is not possible: glibc 2.30
+and later refuse to load PIE executables as libraries. Because \texttt{LD\_PRELOAD} is inherited,
+wrappers and children are covered: \texttt{lowvram uv run script.py} reaches the Python interpreter
+that \texttt{uv} starts.
+
+\subsection{Scope}
+Allocations that bypass \texttt{cuMemAlloc} are not converted: stream-ordered allocation
+(\texttt{cudaMallocAsync}) and the virtual memory management API (\texttt{cuMemCreate}/
+\texttt{cuMemMap}), which PyTorch uses when \texttt{expandable\_segments} is enabled. These remain
+limited to device memory. The implementation targets Linux with glibc on x86-64.
+\todo{AArch64: fix the dlvsym fallback (GLIBC\_2.17) and test before claiming it.}
+
+% ---------------------------------------------------------------------------
+\section{Methodology}
+\label{sec:method}
+
+\paragraph{Machine.} NVIDIA GeForce RTX 3060 Laptop GPU (GA106, 6\,GiB, compute capability 8.6),
+Intel Core i7-11800H (8 cores, 16 threads), 31\,GiB RAM, Linux 7.0, NVIDIA driver 595.91.07,
+glibc 2.43, PyTorch 2.14.1 with CUDA 13.0, Transformers 4.57.6. The GPU also drives the
+display, which holds about 0.7\,GiB, so \num{usableVram}\,GiB were free to the benchmarks. Its link
+is PCIe 4.0 x16-capable but trained at x8 by the laptop; pinned host-to-device copies reach
+\num{pcieHtoD}\,GB/s and device-to-host \num{pcieDtoH}\,GB/s. This bandwidth, not the GPU,
+bounds every strategy that moves data.
+
+\paragraph{Procedure.} Every configuration runs in a fresh process, with and without lowvram
+preloaded. Synthetic benchmarks report the median of five timed repetitions after a warm-up
+(twenty for GEMM, three or two for slow CPU runs); the YuE2 benchmarks repeat each configuration
+in \num{yueRepeats} separate processes and report the median. An out-of-memory error is recorded as
+a result. The benchmark scripts, the raw JSON results and the script that turns them into every
+figure, table and number in this paper are in \texttt{docs/bench} of the source repository.
+
+\paragraph{Synthetic workloads.}
+(i) \emph{GEMM}: an $8192\times8192$ matrix product in FP16 and FP32.
+(ii) \emph{Sweep}: a working set of 256\,MiB tensors, each incremented in place once per pass in a
+fixed order; we report effective bandwidth (bytes read plus written per second).
+(iii) \emph{Layer stack}: a chain of $8192\times8192$ FP16 matrix products standing in for
+transformer inference, with 2--12\,GiB of weights and batch 16 (memory-bound) or 2048
+(compute-bound). It runs in seven modes: \emph{gpu} (weights allocated on the GPU; unmodified
+PyTorch or lowvram), \emph{manual streaming} (weights in pinned RAM, each layer copied to the GPU
+just before use), \emph{overlapped streaming} (the copy of layer $i{+}1$ overlaps the product of
+layer $i$ on a second stream, the standard double-buffering scheme), \emph{CPU} (FP32, because
+the CPU lacks fast FP16 arithmetic), and three \emph{hint} modes that run under lowvram and add one
+driver hint from the program: \texttt{READ\_MOSTLY} on all weights (evicting a read-duplicated
+page drops it instead of copying it back), \emph{prefetch} (\texttt{cuMemPrefetchAsync} of the
+next two layers on a side stream), and \emph{remote map} (the layers that do not fit a 3.5\,GiB
+budget are pinned to host RAM and mapped for direct access, so they never migrate). The hint modes
+measure how much an informed program could recover; lowvram itself issues no hints.
+
+\paragraph{Real workload: YuE2-3B.} YuE2 \cite{yue2} is a music generation model whose
+3.6 billion BF16 parameters occupy 7.26\,GB (6.76\,GiB)---more than this GPU has. It is an AR--NAR
+``mixture of transformers'': each of its 28 layers holds two attention blocks and two MLPs, one
+pair for autoregressive token generation (AR) and one for a flow-matching decoder (NAR). Token
+generation uses only the AR pair, the embeddings and the output head, about 3.4\,GiB; a
+flow-matching step runs both pairs over the whole sequence. We measure both phases with the model's
+own code through Transformers: AR prefill of 512 tokens and greedy decoding of 96 tokens with a KV
+cache (excluding the first 16 from the median), and NAR velocity evaluations over a 1,538-token
+sequence (512 context tokens, 1,024 latent frames). Inputs are synthetic token ids and latents of
+the real shapes, since timing depends on shapes, not values. Modes: unmodified PyTorch;
+lowvram; Accelerate \cite{accelerate} with \texttt{device\_map="auto"} and a 4\,GiB weight budget,
+the standard way to run an oversized Hugging Face model; CPU in BF16; and, for token generation, an
+\emph{oracle} that deletes the NAR half before moving the model to the GPU, so that the AR half
+runs from ordinary device memory. The oracle requires knowing the model's structure; it is the
+speed lowvram would reach with perfect placement.
+
+\paragraph{Real workload: a dense language model.} YuE2's two paths favor demand paging, so we add
+the general case: Qwen3-4B, a dense decoder whose \num{llmWeightsGiB}\,GiB of BF16 weights are all
+read for every token. We measure prompt processing of 1,024 tokens (compute-bound) and greedy
+generation of 48 tokens (memory-bound) through Transformers, in the same modes as YuE2 except the
+oracle, which does not exist for a model with no idle half.
+
+% ---------------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+
+\subsection{No cost when the working set fits}
+
+\begin{table}[h]
+\centering\small
+\input{generated/table_overhead.tex}
+\caption{Working sets that fit in VRAM: managed memory performs like device memory.}
+\label{tab:overhead}
+\end{table}
+
+Table~\ref{tab:overhead} compares unmodified PyTorch with the same program under lowvram when
+everything fits. GEMM throughput and sweep bandwidth agree within 1\%; the layer stack differs by
+a few percent in both directions, within the spread of the individual repetitions (the ranges
+overlap; a laptop GPU's clocks vary with temperature). After the first touch, managed pages are
+resident and accessed at full device bandwidth. lowvram can therefore be left on: it costs nothing
+until it is needed.
+
+\subsection{Cyclic access beyond VRAM}
+
+\begin{figure}[h]
+\centering
+\fig{0.72\linewidth}{sweep}
+\caption{Effective bandwidth of a working set touched once per pass in a fixed order.}
+\label{fig:sweep}
+\end{figure}
+
+Figure~\ref{fig:sweep} shows the cost of oversubscription in its purest form. While the working
+set fits, both configurations run at about \num{sweepFitGBps}\,GB/s; unmodified PyTorch fails
+beyond \num{usableVram}\,GiB, and lowvram drops to \num{sweepOversubGBps}\,GB/s at every larger
+size. Cyclic access over a set larger than memory is the worst case for least-recently-used
+eviction: the page needed next is always the one evicted longest ago, so every access misses and
+each pass migrates the whole set over PCIe. The effective rate sits slightly above the pinned-copy
+bandwidth because migration runs in both directions at once (pages in, evicted pages out) and the
+metric counts bytes read plus written. The cliff is the whole story of demand paging: no
+gradual degradation, but full speed or PCIe speed, depending on whether the set that is
+\emph{reused} fits.
+
+\subsection{Layer stack: paging versus streaming, and what hints recover}
+
+\begin{figure}[h]
+\centering
+\fig{\linewidth}{layers}
+\caption{Seconds per forward pass of the layer stack. Unmodified PyTorch fails beyond the free
+VRAM (shaded).}
+\label{fig:layers}
+\end{figure}
+
+\begin{table}[h]
+\centering\small
+\input{generated/table_layers.tex}
+\caption{Layer stack beyond VRAM, seconds per forward pass (median).}
+\label{tab:layers}
+\end{table}
+
+The layer stack reads every weight once per pass, in order: the same cyclic pattern, now with
+computation in between (Figure~\ref{fig:layers}, Table~\ref{tab:layers}; numbers below are for
+8\,GiB of weights).
+
+\paragraph{Paging versus streaming.} lowvram alone takes \num{layersLoLv}\,s per pass at batch 16
+and \num{layersHiLv}\,s at batch 2048, against \num{layersLoOff} and \num{layersHiOff}\,s for
+manual streaming and \num{layersLoOvl} and \num{layersHiOvl}\,s for overlapped streaming. Demand
+paging is thus 1.4--2.1$\times$ slower than a hand-written scheme. Three properties explain the
+gap: transfers start only after a fault, in small granules, instead of as large DMA copies; they
+do not overlap computation, because the kernel that needs the data is the one waiting for it; and
+eviction copies every page back to host memory, although the weights never change, so PCIe
+carries each byte twice.
+
+\paragraph{What one hint recovers.} The hint modes test how much of that gap a program could
+close by telling the driver one thing it knows. \texttt{READ\_MOSTLY} on the weights removes the
+write-back: evicting a read-duplicated page drops it. That alone brings paging to \num{layersLoRm}
+and \num{layersHiRm}\,s, about 10\% slower than manual streaming at batch 16. Prefetching the next two
+layers makes things \emph{worse} (\num{layersLoPf} and \num{layersHiPf}\,s): when memory is full,
+every prefetch forces an eviction, and the prefetched pages compete with the ones in use.
+Mapping the layers beyond a 3.5\,GiB budget for direct access from host memory, so that they never
+migrate, is the fastest configuration of all for the memory-bound case (\num{layersLoRem}\,s,
+2.7$\times$ faster than overlapped streaming): the first 3.5\,GiB stay resident, and the rest are
+read once over PCIe, at the link's speed, without copies or faults. The same mapping is the
+slowest for the compute-bound case (\num{layersHiRem}\,s), because a large matrix product reads
+each weight many times, and every one of those reads crosses PCIe.
+
+\paragraph{CPU crossover.} At batch 16 the CPU computes the 8\,GiB stack in \num{layersLoCpu}\,s,
+faster than lowvram, manual streaming and overlapped streaming, although it reads FP32 weights,
+twice the bytes: it reads host memory directly at tens of GB/s, while every GPU mode is limited by
+the 6\,GB/s link. At batch 2048 the CPU needs \num{layersHiCpu}\,s, and every GPU mode wins by an
+order of magnitude.
+
+The lesson for lowvram is that the mechanism is sound but uninformed. Its default---migrate on
+fault, evict by recency, write back---is the right one for data that is reused and modified, and
+the wrong one for read-only data streamed once per pass. A hint that only the program can give
+recovers most of the difference.
+
+\subsection{A real model: YuE2-3B}
+
+\begin{figure}[h]
+\centering
+\fig{\linewidth}{yue2}
+\caption{YuE2-3B on a 6\,GiB GPU. Left: token generation, which uses half of the weights.
+Right: a flow-matching step, which uses all of them.}
+\label{fig:yue2}
+\end{figure}
+
+\begin{table}[h]
+\centering\small
+\input{generated/table_yue2.tex}
+\caption{YuE2-3B, median over \num{yueRepeats} runs (CPU: one run).}
+\label{tab:yue2}
+\end{table}
+
+Unmodified PyTorch cannot load YuE2 on this GPU. Under lowvram the same code generates
+\num{yueLvDecode} tokens per second (range over runs \num{yueLvDecodeRange}): \num{yueLvOfOracle}\%
+of the \num{yueOracleDecode} tokens per second of the oracle, which runs the AR half from ordinary
+device memory after we deleted the NAR half by hand. Accelerate, the standard way to run an
+oversized Hugging Face model, reaches \num{yueAccDecode} tokens per second---lowvram is
+\num{yueLvOverAcc}$\times$ faster---and the CPU \num{yueCpuDecode}.
+
+The difference is placement granularity. Accelerate places whole decoder layers, the unit the
+model declares as unsplittable, and each layer on the CPU side carries its NAR attention and MLP
+along with the AR ones; for every token it copies all offloaded layers to the GPU, including the
+half that token generation never touches. Demand paging needs no declaration: the NAR pages are
+never accessed during generation, so they are evicted once and stay in host memory, and the
+3.4\,GiB the AR path reads every token stay resident. Figure~\ref{fig:warmup} shows the transient:
+the first tokens fault the AR weights in, then the per-token latency settles within a few percent of
+the oracle's. Prompt processing, which runs once, pays for that first touch: \num{yueLvPrefill}
+tokens per second against \num{yueOraclePrefill} for the oracle and \num{yueAccPrefill} for
+Accelerate.
+
+The flow-matching step is the opposite case. It runs both halves over a 1,538-token sequence, so
+all 6.8\,GiB are touched every step, in layer order: the cyclic pattern of
+Figure~\ref{fig:sweep}. lowvram needs \num{yueLvNar}\,s per step against \num{yueAccNar}\,s for
+Accelerate, which keeps 4\,GiB resident and streams the rest in planned copies; paging is
+\num{yueNarSlowdown}$\times$ slower. The CPU needs \num{yueCpuNar}\,s per step.
+
+The same program therefore shows both regimes. When the data a phase reuses fits, transparent
+paging finds it at page granularity, without being told, and runs close to native speed; when it
+does not, a planned scheme with knowledge of the model wins.
+
+\subsection{A dense model: Qwen3-4B}
+
+\begin{figure}[h]
+\centering
+\fig{\linewidth}{llm}
+\caption{Qwen3-4B (\num{llmWeightsGiB}\,GiB of BF16 weights) on the same GPU.}
+\label{fig:llm}
+\end{figure}
+
+YuE2's split hot set favors demand paging. A dense language model is the general case and the
+unfavorable one: every generated token reads every weight, so the reused set is the whole model.
+Qwen3-4B holds \num{llmWeightsGiB}\,GiB of BF16 weights (Figure~\ref{fig:llm},
+Table~\ref{tab:llm}). Unmodified PyTorch cannot load it. Under lowvram, token generation runs at
+\num{llmLvDecode} tokens per second: each token migrates the model through the 6\,GB/s link, in
+both directions, as in the sweep. Accelerate reaches \num{llmAccDecode} tokens per second by keeping
+4\,GiB resident and copying only the rest, once, in planned transfers; the CPU reaches
+\num{llmCpuDecode}, the fastest of the three, because it reads host memory directly instead of
+through the link. Prompt processing reuses each weight across the prompt's 1,024 tokens, so
+transfers matter less: lowvram reaches \num{llmLvPrefill} tokens per second, against
+\num{llmAccPrefill} for Accelerate and \num{llmCpuPrefill} for the CPU. Here lowvram is the
+slowest GPU option but still an order of magnitude faster than the CPU.
+
+\begin{table}[h]
+\centering\small
+\IfFileExists{generated/table_llm.tex}{\input{generated/table_llm.tex}}{\na}
+\caption{Qwen3-4B, median over \num{yueRepeats} runs (CPU: one run).}
+\label{tab:llm}
+\end{table}
+
+For dense models larger than VRAM, demand paging is the wrong tool: a planned split is
+faster in both phases, and for token generation a scheme that computes the remainder on the
+CPU---as hybrid engines such as llama.cpp do---is faster still. lowvram turns the failure into a
+run, but when a framework offers offloading, it should be preferred for such models.
+
+\begin{figure}[h]
+\centering
+\fig{0.72\linewidth}{yue2_warmup}
+\caption{Per-token latency of YuE2 token generation under lowvram and the oracle.}
+\label{fig:warmup}
+\end{figure}
+
+% ---------------------------------------------------------------------------
+\section{Where lowvram is valuable}
+\label{sec:where}
+
+The measurements reduce to one question: \emph{does the data that a phase reuses fit in
+VRAM?} The total size of the program does not matter; the reused set does.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{p{4.6cm}p{2.6cm}p{6.6cm}}
+\toprule
+Situation & lowvram & Evidence and alternative \\
+\midrule
+Program fits & free & Table~\ref{tab:overhead}; can be left on \\
+Total exceeds VRAM, reused set fits (multi-path models, pipelines of several models, rarely used
+modules) & \textbf{best option} & YuE2 generation: \num{yueLvOfOracle}\% of native,
+\num{yueLvOverAcc}$\times$ Accelerate; no alternative finds the hot set without being told \\
+Transient peak (one large batch, a decode step at high resolution) & \textbf{best option} & a
+crash becomes a slow step; offloading the whole run to avoid one peak costs every step \\
+Reused set exceeds VRAM, compute-bound & works, 1.4--2$\times$ slower than planned streaming &
+YuE2 flow step, layer stack at batch 2048; use framework offloading if available \\
+Reused set exceeds VRAM, memory-bound (dense LLM decoding) & works, but slowest & Qwen3-4B,
+layer stack at batch 16; CPU or a hybrid engine (llama.cpp) is faster \\
+Multi-process GPU sharing, \texttt{cudaMallocAsync}, \texttt{cuMemCreate} & not covered & allocations
+bypass the hook \\
+\bottomrule
+\end{tabular}
+\caption{When transparent oversubscription is the right tool.}
+\label{tab:where}
+\end{table}
+
+In practice the comparison is often not with an optimized offload engine but with a program that
+cannot run at all, or with porting it to a framework that can offload. lowvram makes the program
+run first; Table~\ref{tab:where} tells whether it is then worth the effort to do better.
+
+\paragraph{What could close the gap.} The hint experiments point at a middle ground between a
+transparent shim and a framework. A program---or a framework integration---that marks its weights
+\texttt{READ\_MOSTLY} recovers most of the distance to hand-written streaming, and one that knows
+which weights are read once per pass can map them for direct access and beat streaming in the
+memory-bound regime. Neither hint is safe to apply blindly to every allocation: read-mostly pages
+are expensive to write, and direct access is slow for data that is reused. Applying them from
+allocation-time heuristics (size, first-write behavior) is future work.
+
+% ---------------------------------------------------------------------------
+\section{Limitations and threats to validity}
+
+One machine, one GPU generation and one PCIe configuration (x8); a desktop GPU with an x16 link
+has twice the transfer bandwidth and would shift every oversubscribed number. The GPU also drove
+the display. YuE2 inputs are synthetic; the sampling loop is greedy; we do not measure audio
+quality, which lowvram cannot change. Reported free memory is inflated by a constant, which can
+lead a program to exhaust host RAM. The comparison with Accelerate uses one weight budget.
+\todo{CPU baseline in BF16 on a CPU without native BF16; llama.cpp hybrid not measured.}
+
+% ---------------------------------------------------------------------------
+\section{Related work}
+
+\paragraph{Unified Memory.} Unified Memory oversubscription and its performance have been studied
+extensively: Landaverde et al.\ \cite{landaverde2014} measured early Unified Memory performance;
+Zheng et al.\ \cite{zheng2016} examined paged GPU memory and the role of prefetching; Ganguly et
+al.\ \cite{ganguly2019} the interplay of prefetching and eviction under oversubscription; DeepUM
+\cite{deepum} adds correlation prefetching for DNN training. TensorFlow exposed oversubscription
+through a memory fraction above one \cite{tf-unified}, and the paged optimizers of
+bitsandbytes \cite{qlora} place optimizer state in managed memory. lowvram applies the mechanism to
+unmodified programs, below any framework.
+
+\paragraph{API interposition.} Intercepting the CUDA API is how GPUs are remoted and shared:
+rCUDA \cite{rcuda} and GVirtuS \cite{gvirtus} forward calls to remote GPUs, and Kubernetes
+sharing layers such as HAMi \cite{hami} interpose on allocation to enforce quotas. lowvram uses the
+same technique for a different end, and documents the lookup path a modern CUDA runtime requires.
+
+\paragraph{Tensor swapping and offloading.} vDNN \cite{vdnn} offloads activations during training;
+SwapAdvisor \cite{swapadvisor} and Capuchin \cite{capuchin} plan swapping and recomputation;
+ZeRO-Offload and ZeRO-Infinity \cite{zero-offload,zero-infinity} offload optimizer state and
+parameters to CPU and NVMe; FlexGen \cite{flexgen} schedules LLM inference across GPU, CPU and
+disk; Accelerate \cite{accelerate} places modules across devices. These systems use knowledge of
+the computation to outperform demand paging, but require running within their framework.
+
+\paragraph{Hybrid CPU--GPU inference.} llama.cpp \cite{llamacpp} computes the layers that do not
+fit on the CPU; PowerInfer \cite{powerinfer} splits hot and cold neurons between GPU and CPU;
+KTransformers \cite{ktransformers} and expert offloading \cite{eliseev2023} do so for
+mixture-of-experts models. For memory-bound decoding they beat any scheme that moves weights over
+PCIe, at the cost of model-specific engines.
+
+% ---------------------------------------------------------------------------
+\section{Conclusion}
+
+A small interposition library---three replaced driver functions plus the lookups that reach
+them---runs unmodified CUDA programs beyond device memory. It costs nothing when a program fits and
+turns out-of-memory failures into runs when it does not. Its speed beyond VRAM is decided by one
+property of the workload, whether the data a phase reuses fits: when it does, demand paging finds
+it at page granularity without being told, and a 7.3\,GB music model runs on a 6\,GiB laptop GPU
+at \num{yueLvOfOracle}\% of native speed, \num{yueLvOverAcc}$\times$ faster than standard
+offloading; when it does not, paging is bound by PCIe and a planned or CPU-based scheme is faster.
+A single driver hint from the program recovers most of that difference, which marks the next step:
+moving from a transparent shim towards an informed one, without giving up the property that makes
+it useful---no change to the program.
+
+\bibliographystyle{plain}
+\bibliography{references}
+\end{document}

@@ -1,0 +1,16 @@
+\begin{tabular}{lrrrrrr}
+\toprule
+ & \multicolumn{3}{c}{batch 16} & \multicolumn{3}{c}{batch 2048} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Mode & 6\,GiB & 8\,GiB & 12\,GiB & 6\,GiB & 8\,GiB & 12\,GiB \\
+\midrule
+Unmodified & OOM & OOM & OOM & OOM & OOM & OOM \\
+lowvram & 1.83 & 2.49 & 3.76 & 2.20 & 3.01 & 4.72 \\
+lowvram + ReadMostly & 1.26 & 1.61 & 2.70 & 1.63 & 2.32 & 3.30 \\
+lowvram + prefetch & 2.98 & 3.75 & 5.92 & 3.34 & 4.50 & 6.64 \\
+lowvram + remote map & 0.33 & 0.51 & 1.12 & 4.57 & 9.12 & 16.98 \\
+manual streaming & 1.06 & 1.46 & 2.25 & 1.57 & 2.08 & 3.10 \\
+manual streaming, overlapped & 1.05 & 1.38 & 2.24 & 1.05 & 1.41 & 2.07 \\
+CPU (FP32) & -- & 0.96 & -- & -- & 27.85 & -- \\
+\bottomrule
+\end{tabular}

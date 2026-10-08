@@ -1,0 +1,13 @@
+\begin{tabular}{lrrrr}
+\toprule
+ & \multicolumn{2}{c}{Token generation (AR)} & \multicolumn{2}{c}{Flow-matching step (NAR)} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Mode & prompt tok/s & decode tok/s & s/step & GPU weights \\
+\midrule
+Unmodified & OOM & OOM & OOM & all \\
+Accelerate offload & 607 & 1.9 & 1.32 & part \\
+CPU (BF16) & 46 & 6.8 & 52.18 & none \\
+lowvram & 611 & 43.1 & 1.90 & all (paged) \\
+AR half only (oracle) & 1694 & 45.3 & -- & AR half \\
+\bottomrule
+\end{tabular}
