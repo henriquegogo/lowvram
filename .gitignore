@@ -22,4 +22,3 @@ __pycache__/
 /docs/paper/*.out
 /docs/paper/*.synctex.gz
 /docs/paper/*.toc
-/docs/paper/paper.pdf
